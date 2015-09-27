@@ -38,3 +38,5 @@ library
    , http-types
    , http-client
    , http-client-tls
+
+  ghc-options: -Wall

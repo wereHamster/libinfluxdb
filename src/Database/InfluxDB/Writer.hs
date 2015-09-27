@@ -2,13 +2,11 @@
 {-# LANGUAGE RecordWildCards   #-}
 
 module Database.InfluxDB.Writer
-    ( Config, Handle
+    ( Config(..), Handle
     , createHandle, newHandle
 
     , Value(..), Tags, Fields
-    , writePoint
-
-    , test
+    , writePoint, writePoint'
     ) where
 
 
@@ -29,7 +27,6 @@ import           Control.Concurrent.STM
 
 import           System.Clock
 
-import           Network.HTTP.Types.Header
 import           Network.HTTP.Client
 import           Network.HTTP.Client.TLS (tlsManagerSettings)
 
@@ -43,14 +40,7 @@ data Config = Config
     }
 
 data Handle = Handle
-    { hConfig  :: !Config
-    , hManager :: !Manager
-
-    , hRequest :: !Request
-      -- ^ A template for a request which includes everything but the request
-      -- body.
-
-    , hPool :: Pool (TQueue (Maybe Point))
+    { hPool :: Pool (TQueue (Maybe Point))
       -- ^ A pool of threads which consume messages from 'TQueue's and write
       -- them in batches to InfluxDB.
     }
@@ -67,7 +57,7 @@ newHandle c manager = do
     req  <- mkRequestTemplate <$> parseUrl (cURL c)
     pool <- createPool (allocateResource req) releaseResource 1 600 3
 
-    return $ Right $ Handle c manager req pool
+    return $ Right $ Handle pool
 
   where
     mkRequestTemplate req = req
@@ -102,8 +92,8 @@ newHandle c manager = do
                     else return $ (acc ++ points, False)
 
 
-    flushQueue :: Manager -> Request -> TQueue (Maybe Point) -> IO ()
-    flushQueue manager req queue = do
+    flushQueue :: Request -> TQueue (Maybe Point) -> IO ()
+    flushQueue req queue = do
         -- Dequeue the next batch of points. This operation will block until
         -- 20 points are available or a timeout is reached, whichever comes
         -- first.
@@ -112,7 +102,7 @@ newHandle c manager = do
 
         let sleep    = threadDelay $ 5 * 1000000
             flush    = flushPoints manager req points
-            continue = flushQueue manager req queue
+            continue = flushQueue req queue
 
         -- Deciding what to do next is a bit tricky.
         case (length points, isLast) of
@@ -127,7 +117,7 @@ newHandle c manager = do
         queue <- newTQueueIO
 
         -- Fork off a thread which periodically flushes the queue.
-        void $ forkIO $ flushQueue manager req queue
+        void $ forkIO $ flushQueue req queue
 
         return queue
 
@@ -170,8 +160,6 @@ writePoint' h measurement tags fields timestamp =
 
 flushPoints :: Manager -> Request -> [Point] -> IO ()
 flushPoints manager requestTemplate points = do
-    putStrLn $ "Flusing points: " ++ show (length points)
-    print body
     void $ httpLbs req manager
 
   where
@@ -194,12 +182,3 @@ flushPoints manager requestTemplate points = do
 
     body = T.encodeUtf8 $ T.intercalate "\n" $ map line points
     req = requestTemplate { requestBody = RequestBodyBS body }
-
-
-test = do
-    Right h <- createHandle (Config "http://localhost:8086/write" "rmx")
-    writePoint h "test" (M.empty) ((M.singleton "value" (F 134)))
-    threadDelay $ 1000000
-    writePoint h "test" (M.empty) ((M.singleton "value" (F 234)))
-    threadDelay $ 1000000
-    writePoint h "test" (M.empty) ((M.singleton "value" (F 334)))
