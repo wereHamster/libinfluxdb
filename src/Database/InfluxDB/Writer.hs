@@ -22,6 +22,7 @@ import           Data.Map (Map)
 import qualified Data.Map as M
 
 import           Control.Monad
+import           Control.Exception
 import           Control.Concurrent
 import           Control.Concurrent.STM
 
@@ -67,49 +68,57 @@ newHandle c manager = do
         }
 
 
-    dequeuePoints :: [Point] -> TQueue (Maybe Point) -> Int -> STM ([Point], Bool)
-    dequeuePoints acc queue n
-        | n <= 0    = return $ (reverse acc, False)
-        | otherwise = do
-            mbPoint <- tryReadTQueue queue
+    drainQueue :: TQueue (Maybe Point) -> Int -> Int -> IO [Point]
+    drainQueue queue timeout count = do
+        box <- newEmptyTMVarIO
+        tmp <- newTVarIO []
+
+        void $ forkFinally (go tmp count) $
+            (\_ -> atomically $ readTVar tmp >>= putTMVar box . reverse)
+
+        atomically $ readTMVar box
+
+      where
+        go _   0 = return ()
+        go tmp n = mask $ \restore -> do
+            mbPoint <- restore $ atomically $ do
+                mbPoint <- readTQueue queue
+                case mbPoint of
+                    Nothing -> return Nothing
+                    Just p  -> do
+                        modifyTVar' tmp (\x -> p : x)
+                        return mbPoint
+
             case mbPoint of
-                Nothing       -> return $ (reverse acc, False)
-                Just Nothing  -> return $ (reverse acc, True)
-                Just (Just p) -> dequeuePoints (p:acc) queue (n - 1)
+                Nothing -> return ()
+                Just _  -> do
+                    when (n == count) $ do
+                        threadId <- myThreadId
+                        void $ forkFinally (threadDelay timeout) $ \_ -> killThread threadId
 
-
-    dequeueBatch :: [Point] -> TQueue (Maybe Point) -> TimeSpec -> Int -> IO ([Point], Bool)
-    dequeueBatch acc queue start n = do
-        mbNextBatch <- atomically $ dequeuePoints [] queue n
-        case mbNextBatch of
-            (points, True) -> return (points, True)
-            (points, False) -> do
-                -- We can collect more points if we still have space AND time
-                -- left. Otherwise return what we have.
-                now <- getTime Monotonic
-                if length points < n && timeSpecAsNanoSecs (diffTimeSpec start now) < (10 * 1000000000)
-                    then dequeueBatch (acc ++ points) queue start (n - length points)
-                    else return $ (acc ++ points, False)
+                    restore $ go tmp (n - 1)
 
 
     flushQueue :: Request -> TQueue (Maybe Point) -> IO ()
     flushQueue req queue = do
+        let batchSize = 50
+        let timeout   = 10 * 1000 * 1000
+
         -- Dequeue the next batch of points. This operation will block until
-        -- 20 points are available or a timeout is reached, whichever comes
-        -- first.
-        start <- getTime Monotonic
-        (points, isLast) <- dequeueBatch [] queue start 20
+        -- a batch of points is available.
+        points <- drainQueue queue timeout batchSize
 
-        let sleep    = threadDelay $ 5 * 1000000
-            flush    = flushPoints manager req points
-            continue = flushQueue req queue
+        -- If the batch is non-empty, send the points to InfluxDB.
+        when (length points > 0) $
+            flushPoints manager req points
 
-        -- Deciding what to do next is a bit tricky.
-        case (length points, isLast) of
-            (0, True)  -> return ()
-            (0, False) -> sleep >> continue
-            (_, True)  -> flush
-            (_, False) -> flush >> continue
+        -- If the batch is not full, it means there wasn't enough data in the
+        -- queue. So we can sleep a bit.
+        when (length points < batchSize) $
+            threadDelay $ 5 * 1000000
+
+        -- Repeat.
+        flushQueue req queue
 
 
     allocateResource :: Request -> IO (TQueue (Maybe Point))
@@ -117,7 +126,12 @@ newHandle c manager = do
         queue <- newTQueueIO
 
         -- Fork off a thread which periodically flushes the queue.
-        void $ forkIO $ flushQueue req queue
+        --
+        -- Async exceptions in the thread are completely masked, the only way
+        -- to dispose of this thread is to write 'Nothing' into the queue.
+
+        void $ mask_ $ forkIO $ flushQueue req queue
+
 
         return queue
 
@@ -158,11 +172,16 @@ writePoint' h measurement tags fields timestamp =
 
 
 
+-- | Send a batch of points to the InfluxDB server. When the server is
+-- unreachable, the batch is lost. Delivery is not retried.
 flushPoints :: Manager -> Request -> [Point] -> IO ()
 flushPoints manager requestTemplate points = do
-    void $ httpLbs req manager
+    void send
 
   where
+    send :: IO (Either SomeException ())
+    send = try $ void $ httpLbs req manager
+
     renderValue :: Value -> Text
     renderValue (I x) = (T.pack $ show x) <> "i"
     renderValue (F x) = (T.pack $ show x)
