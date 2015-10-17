@@ -14,6 +14,8 @@ import           Data.Int
 import           Data.Monoid
 import           Data.Pool
 
+import qualified Data.ByteString as BS
+
 import           Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -37,7 +39,11 @@ import           Prelude
 
 data Config = Config
     { cURL :: !String
-    , cDB  :: !String
+      -- ^ The database name is extracted from the path (the leading slash is
+      -- dropped, the tail is the database name). The rest of the URL (hostname,
+      -- port, auth info) describes how to access the InfluxDB server.
+      --
+      -- Example: @http://localhost:8086/testdb@
     }
 
 data Handle = Handle
@@ -64,7 +70,7 @@ newHandle c manager = do
     mkRequestTemplate req = req
         { method      = "POST"
         , path        = "/write"
-        , queryString = "?db=" <> T.encodeUtf8 (T.pack (cDB c))
+        , queryString = "?db=" <> BS.tail (path req)
         }
 
 
